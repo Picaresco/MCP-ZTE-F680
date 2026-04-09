@@ -1,6 +1,10 @@
 # MCP-ZTE-F680
 
-MCP Server (Model Context Protocol) para gestionar NAT/port forwarding en un router **ZTE ZXHN F680** (GPON ONT) desde [Claude Code](https://claude.ai/claude-code) o cualquier cliente MCP compatible.
+![MCP-ZTE-F680 Banner](assets/banner.png)
+
+MCP Server (Model Context Protocol) para gestionar NAT/port forwarding en un router **ZTE ZXHN F680** (GPON ONT) desde cualquier agente IA compatible con MCP.
+
+**Compatible con:** Claude Code, OpenAI Agents, Gemini CLI, Cursor, Windsurf, Copilot y otros clientes MCP.
 
 ## Que hace
 
@@ -27,7 +31,7 @@ Controla las reglas de redireccion de puertos (port forwarding) del router ZTE F
 ### 1. Clonar el repositorio
 
 ```bash
-git clone https://github.com/Picaresco/MainPrograms.git MCP-ZTE-F680
+git clone https://github.com/Picaresco/MCP-ZTE-F680.git
 cd MCP-ZTE-F680
 ```
 
@@ -63,17 +67,14 @@ ZTE_PASSWORD=tu_password_aqui
 
 > **Nota:** El fichero `.env` contiene credenciales y esta excluido del repositorio via `.gitignore`. Nunca subas tus credenciales reales.
 
-### 4. Registrar en Claude Code
+### 4. Registrar en tu cliente MCP
 
+**Claude Code:**
 ```bash
 claude mcp add zte "/ruta/al/proyecto/venv/Scripts/python.exe" "/ruta/al/proyecto/zte_mcp_server.py"
 ```
 
-Ejemplo en Windows:
-
-```bash
-claude mcp add zte "C:\MCP-ZTE-F680\venv\Scripts\python.exe" "C:\MCP-ZTE-F680\zte_mcp_server.py"
-```
+**Otros clientes MCP (Cursor, Windsurf, etc.):** Configurar como servidor stdio apuntando al mismo comando.
 
 ### 5. Verificar
 
@@ -84,7 +85,7 @@ claude mcp list
 
 ## Uso
 
-Una vez registrado, las herramientas estan disponibles directamente en Claude Code:
+Una vez registrado, las herramientas estan disponibles directamente desde tu agente IA:
 
 ```
 > Lista las reglas NAT de mi router ZTE
