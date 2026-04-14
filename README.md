@@ -1,5 +1,9 @@
 # zte-f680-mcp
 
+<p align="center">
+  <img src="assets/banner.png" alt="zte-f680-mcp banner" width="100%">
+</p>
+
 MCP Server ([Model Context Protocol](https://modelcontextprotocol.io)) to manage **NAT / port forwarding** on a **ZTE ZXHN F680** GPON router from any MCP-compatible client (Claude Desktop, Claude Code, Cursor, Windsurf, OpenAI Agents SDK, Cline, Continue, etc.).
 
 > Control your router port forwarding rules conversationally, without opening the web UI.
