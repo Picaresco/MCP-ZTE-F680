@@ -1,7 +1,19 @@
 .env
 venv/
+.venv/
 __pycache__/
 *.pyc
 port_fwd_raw.html
 poc_*.py
 sha256.min.js
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
