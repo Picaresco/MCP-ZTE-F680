@@ -13,10 +13,23 @@ MCP Server ([Model Context Protocol](https://modelcontextprotocol.io)) to manage
 | Tool | Description |
 |---|---|
 | `zte_get_port_forwards` | List all NAT rules |
-| `zte_add_port_forward` | Add a new port forwarding rule |
+| `zte_open_port` | **Quick-open a port** with smart defaults (auto-detect local IP, same port both sides) |
+| `zte_get_local_ip` | Return the host IP in the router's subnet (cross-platform) |
+| `zte_add_port_forward` | Add a rule with full control (ranges, custom internal IP/port) |
 | `zte_modify_port_forward` | Modify an existing rule by index |
 | `zte_delete_port_forward` | Delete a rule by index |
 | `zte_run_page` | Fetch and parse any page from the router (generic) |
+
+### Quick-open flow (v0.2.0+)
+
+Ask your assistant plainly and it will confirm before touching the router:
+
+> **You:** open port 8080
+> **Assistant:** Your local IP is `192.168.1.128`. Should I forward `8080 → 192.168.1.128:8080`?
+> **You:** yes
+> **Assistant:** ✓ Rule added.
+
+Under the hood the assistant calls `zte_get_local_ip` (to pick the correct interface even on multi-homed hosts) and then `zte_open_port(port=8080)`. If you want a different internal port or IP, just say so and the assistant switches to `zte_add_port_forward` with your values.
 
 ## Requirements
 
@@ -40,7 +53,7 @@ Edit `claude_desktop_config.json`:
   "mcpServers": {
     "zte": {
       "command": "uvx",
-      "args": ["zte-f680-mcp"],
+      "args": ["zte-f680-mcp@latest"],
       "env": {
         "ZTE_HOST": "192.168.1.1",
         "ZTE_USER": "1234",
@@ -51,6 +64,8 @@ Edit `claude_desktop_config.json`:
 }
 ```
 
+> **Tip**: `@latest` makes `uvx` check PyPI on every launch and use the newest version, so users get updates automatically. Remove `@latest` (just `"zte-f680-mcp"`) to pin to whatever was installed first.
+
 ### Claude Code (CLI)
 
 ```bash
@@ -58,7 +73,7 @@ claude mcp add zte \
   --env ZTE_HOST=192.168.1.1 \
   --env ZTE_USER=1234 \
   --env ZTE_PASSWORD=your_password_here \
-  -- uvx zte-f680-mcp
+  -- uvx zte-f680-mcp@latest
 ```
 
 ### Cursor / Windsurf / Cline / Continue
@@ -73,7 +88,7 @@ from agents.mcp import MCPServerStdio
 zte = MCPServerStdio(
     params={
         "command": "uvx",
-        "args": ["zte-f680-mcp"],
+        "args": ["zte-f680-mcp@latest"],
         "env": {
             "ZTE_HOST": "192.168.1.1",
             "ZTE_USER": "1234",
@@ -83,10 +98,24 @@ zte = MCPServerStdio(
 )
 ```
 
+### Upgrading existing installs
+
+If you registered the server before and want to jump to the newest release:
+
+```bash
+# Option 1: force-refresh the cache
+uvx --refresh zte-f680-mcp
+
+# Option 2: wipe the cache for this package only
+uv cache clean zte-f680-mcp
+```
+
+After this, the next time your MCP client launches the server, `uvx` will fetch the latest version.
+
 ### Alternative: classic pip install
 
 ```bash
-pip install zte-f680-mcp
+pip install --upgrade zte-f680-mcp
 ```
 
 Then point your MCP client at the installed script:
