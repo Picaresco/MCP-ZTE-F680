@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import os
 import random
 import re
@@ -21,7 +20,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuracion (desde .env)
+# Configuracion (desde .env o variables de entorno)
 # ---------------------------------------------------------------------------
 ZTE_HOST: str = os.getenv("ZTE_HOST", "192.168.1.1")
 ZTE_USER: str = os.getenv("ZTE_USER", "1234")
@@ -49,17 +48,12 @@ def _decode_hex_escapes(s: str) -> str:
 
 
 def _parse_rules(html: str) -> list[dict[str, str]]:
-    """Extrae reglas de port forwarding del HTML de app_virtual_conf_t.gch.
-
-    Cada regla esta representada por Transfer_meaning('FieldN', 'value')
-    donde N es el indice de la regla.
-    """
+    """Extrae reglas de port forwarding del HTML de app_virtual_conf_t.gch."""
     pat = re.compile(r"Transfer_meaning\('(\w+)'\s*,\s*'([^']*)'\)")
     rows: dict[int, dict[str, str]] = {}
     for m in pat.finditer(html):
         full_name = m.group(1)
         raw_value = m.group(2)
-        # Separar trailing digits (row index) del nombre del campo
         m2 = re.match(r"^(.*?)(\d+)$", full_name)
         if not m2:
             continue
@@ -69,7 +63,6 @@ def _parse_rules(html: str) -> list[dict[str, str]]:
         if row_index not in rows:
             rows[row_index] = {}
         rows[row_index][field_name] = value
-    # Filtrar solo filas que son reglas reales (tienen campo Name)
     return [rows[i] for i in sorted(rows.keys()) if "Name" in rows.get(i, {})]
 
 
@@ -123,7 +116,6 @@ async def _login(client: httpx.AsyncClient) -> bool:
         print("ZTE: no se encontraron tokens de login", file=sys.stderr)
         return False
 
-    # Detectar bloqueo por intentos fallidos
     lock_match = re.search(
         r"Math\.min\(60,\s*(\d+)\s*\+\s*60\s*-\s*(\d+)\)", html
     )
@@ -136,7 +128,6 @@ async def _login(client: httpx.AsyncClient) -> bool:
                 file=sys.stderr,
             )
             await asyncio.sleep(lock_time + 2)
-            # Recargar pagina para obtener tokens frescos
             resp = await client.get(f"http://{ZTE_HOST}/")
             html = resp.text
             mt = re.search(r'Frm_Logintoken",\s*"(\d+)"', html)
@@ -190,14 +181,10 @@ async def _ensure_session() -> httpx.AsyncClient:
 
 
 async def _fetch_port_fwd_page() -> tuple[str, str | None]:
-    """Carga la pagina de port forwarding. Retorna (html, session_token).
-
-    Si la sesion ha expirado, re-autentica automaticamente.
-    """
+    """Carga la pagina de port forwarding. Retorna (html, session_token)."""
     client = await _ensure_session()
     resp = await client.get(f"http://{ZTE_HOST}/{FORM_URL}")
 
-    # Detectar sesion expirada (pagina corta = 404)
     if len(resp.text) < 1000:
         global _session_valid
         _session_valid = False
@@ -277,11 +264,7 @@ mcp = FastMCP(
     }
 )
 async def zte_get_port_forwards() -> str:
-    """Lista todas las reglas NAT/port forwarding configuradas.
-
-    Returns:
-        Tabla con indice, nombre, protocolo, puertos y estado de cada regla.
-    """
+    """Lista todas las reglas NAT/port forwarding configuradas."""
     try:
         html, _ = await _fetch_port_fwd_page()
         rules = _parse_rules(html)
@@ -321,9 +304,6 @@ async def zte_add_port_forward(
         internal_host: IP interna destino (ej: 192.168.1.100).
         internal_port_start: Puerto interno inicial.
         internal_port_end: Puerto interno final.
-
-    Returns:
-        Resultado de la operacion y lista actualizada de reglas.
     """
     try:
         html, token = await _fetch_port_fwd_page()
@@ -362,7 +342,6 @@ async def zte_add_port_forward(
         if err:
             return f"Error del router: {err}"
 
-        # Verificar leyendo las reglas actualizadas
         html2, _ = await _fetch_port_fwd_page()
         rules = _parse_rules(html2)
         added = any(r.get("Name") == name for r in rules)
@@ -403,9 +382,6 @@ async def zte_modify_port_forward(
         internal_host: IP interna destino.
         internal_port_start: Puerto interno inicial.
         internal_port_end: Puerto interno final.
-
-    Returns:
-        Resultado de la operacion y lista actualizada de reglas.
     """
     try:
         html, token = await _fetch_port_fwd_page()
@@ -420,7 +396,6 @@ async def zte_modify_port_forward(
         proto_map = {"TCP+UDP": "0", "UDP": "1", "TCP": "2"}
         proto_code = proto_map.get(protocol.upper(), "0")
 
-        # Necesitamos token fresco (el fetch anterior lo consumio)
         html, token = await _fetch_port_fwd_page()
         if not token:
             return "Error: no se pudo obtener el token de sesion."
@@ -475,9 +450,6 @@ async def zte_delete_port_forward(index: int) -> str:
 
     Args:
         index: Indice de la regla (obtenido con zte_get_port_forwards).
-
-    Returns:
-        Resultado de la operacion y lista actualizada de reglas.
     """
     try:
         html, token = await _fetch_port_fwd_page()
@@ -539,9 +511,6 @@ async def zte_run_page(page_name: str, raw: bool = False) -> str:
         - net_wlanm_conf1_t.gch (WiFi 2.4GHz)
         - net_wlanm_conf2_t.gch (WiFi 5GHz)
         - sec_firewall_conf_t.gch (firewall)
-
-    Returns:
-        Datos parseados o HTML crudo segun el parametro raw.
     """
     try:
         client = await _ensure_session()
@@ -557,7 +526,6 @@ async def zte_run_page(page_name: str, raw: bool = False) -> str:
         if raw:
             return resp.text
 
-        # Parsear Transfer_meaning
         pat = re.compile(r"Transfer_meaning\('(\w+)'\s*,\s*'([^']*)'\)")
         items: list[str] = []
         for m in pat.finditer(resp.text):
@@ -576,5 +544,10 @@ async def zte_run_page(page_name: str, raw: bool = False) -> str:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the installed console script `zte-f680-mcp`."""
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
