@@ -8,6 +8,7 @@ import hashlib
 import os
 import random
 import re
+import socket
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -96,6 +97,30 @@ def _check_response_error(html: str) -> str | None:
         if val and val != "SUCC":
             return val
     return None
+
+
+def _get_local_ip_for(target_host: str) -> str | None:
+    """Devuelve la IP del interfaz que enrutaria hacia target_host.
+
+    Usa el truco UDP: abre un socket SOCK_DGRAM y hace connect() contra
+    target_host. connect() en UDP es solo bind local (no envia paquetes),
+    pero fuerza al SO a elegir el interfaz que se usaria para alcanzar
+    esa IP. getsockname() devuelve entonces la IP local asociada.
+
+    Funciona igual en Linux, Windows y macOS. En hosts multi-homed
+    (varias IPs en varias subredes) devuelve la IP del interfaz correcto
+    para el router configurado.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.settimeout(1.0)
+            s.connect((target_host, 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +229,66 @@ async def _post_form(form_data: dict[str, str]) -> str:
     return resp.text
 
 
+async def _create_port_forward(
+    name: str,
+    protocol: str,
+    ext_start: int,
+    ext_end: int,
+    internal_host: str,
+    int_start: int,
+    int_end: int,
+) -> str:
+    """Crea una regla de port forwarding. Helper compartido por los tools
+    `zte_add_port_forward` (control total) y `zte_open_port` (flujo rapido).
+
+    Retorna un string con el resultado y la lista actualizada de reglas,
+    o un mensaje de error.
+    """
+    html, token = await _fetch_port_fwd_page()
+    if not token:
+        return "Error: no se pudo obtener el token de sesion."
+
+    proto_map = {"TCP+UDP": "0", "UDP": "1", "TCP": "2"}
+    proto_code = proto_map.get(protocol.upper(), "0")
+
+    form_data = {
+        "_SESSION_TOKEN": token,
+        "IF_ACTION": "new",
+        "IF_INDEX": "-1",
+        "Enable": "1",
+        "Name": name,
+        "Protocol": proto_code,
+        "WANCViewName": "IGD.WD1.WCD1.WCIP1",
+        "MinExtPort": str(ext_start),
+        "MaxExtPort": str(ext_end),
+        "InternalHost": internal_host,
+        "MinIntPort": str(int_start),
+        "MaxIntPort": str(int_end),
+        "MinRemoteHost": "0.0.0.0",
+        "MaxRemoteHost": "0.0.0.0",
+        "MacEnable": "0",
+        "InternalMacHost": "NULL",
+        "Description": "",
+        "LeaseDuration": "NULL",
+        "PortMappCreator": "NULL",
+        "ViewName": "NULL",
+        "WANCName": "NULL",
+    }
+
+    resp_html = await _post_form(form_data)
+    err = _check_response_error(resp_html)
+    if err:
+        return f"Error del router: {err}"
+
+    html2, _ = await _fetch_port_fwd_page()
+    rules = _parse_rules(html2)
+    added = any(r.get("Name") == name for r in rules)
+
+    lines = [f"{'Regla anadida.' if added else 'No se pudo verificar.'}\n"]
+    lines.extend(_format_rule(i, r) for i, r in enumerate(rules))
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -246,8 +331,25 @@ mcp = FastMCP(
     instructions=(
         "Servidor MCP para gestionar NAT/port forwarding en un router "
         "ZTE ZXHN F680 (GPON ONT). Permite listar, anadir, modificar y "
-        "borrar reglas de redireccion de puertos. "
-        "Usa zte_run_page para obtener datos de cualquier otra pagina."
+        "borrar reglas de redireccion de puertos.\n"
+        "\n"
+        "FLUJO CONVERSACIONAL cuando el usuario pide 'abre el puerto X':\n"
+        "  1. Llama a zte_get_local_ip para obtener la IP local sugerida "
+        "(la del host que corre el MCP, en la subred del router).\n"
+        "  2. Pregunta al usuario: 'Redirijo el puerto X a <IP_local>:X? "
+        "(si / no, puerto interno distinto / no, otra IP)'.\n"
+        "  3. Si confirma el default: llama a zte_open_port(port=X).\n"
+        "  4. Si pide otro puerto interno: zte_open_port(port=X, "
+        "internal_port=Y).\n"
+        "  5. Si pide otra IP: zte_open_port(port=X, internal_host='Z.Z.Z.Z').\n"
+        "  6. Si necesita un rango de puertos o control total: "
+        "zte_add_port_forward con todos los parametros.\n"
+        "\n"
+        "Nunca inventes IPs internas y nunca abras puertos sin confirmar "
+        "el destino con el usuario.\n"
+        "\n"
+        "Usa zte_run_page para obtener datos de cualquier otra pagina del "
+        "router (DHCP, DMZ, WiFi, firewall, etc)."
     ),
     lifespan=lifespan,
 )
@@ -279,6 +381,99 @@ async def zte_get_port_forwards() -> str:
 
 @mcp.tool(
     annotations={
+        "title": "IP local detectada (subred del router)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+)
+async def zte_get_local_ip() -> str:
+    """Detecta la IP local del host en la subred del router.
+
+    En hosts multi-homed devuelve la IP del interfaz que enrutaria hacia
+    ZTE_HOST, que es la que hay que usar como destino en port forwarding.
+    Funciona en Linux, Windows y macOS sin dependencias externas.
+
+    Usa este tool ANTES de abrir un puerto para sugerir al usuario la IP
+    por defecto. Ejemplo de flujo:
+      1. Usuario: "abre el puerto 8080"
+      2. zte_get_local_ip() -> "192.168.1.133"
+      3. Preguntar: "Redirijo 8080 -> 192.168.1.133:8080?"
+      4. Si confirma: zte_open_port(port=8080)
+    """
+    ip = _get_local_ip_for(ZTE_HOST)
+    if ip is None:
+        return (
+            f"No se pudo detectar la IP local hacia {ZTE_HOST}. "
+            "Verifica conectividad con el router."
+        )
+    return ip
+
+
+@mcp.tool(
+    annotations={
+        "title": "Abrir puerto (rapido, con defaults)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "openWorldHint": True,
+    }
+)
+async def zte_open_port(
+    port: int,
+    protocol: str = "TCP+UDP",
+    internal_host: str | None = None,
+    internal_port: int | None = None,
+    name: str | None = None,
+) -> str:
+    """Abre un puerto con defaults sensatos. Flujo conversacional recomendado.
+
+    Args:
+        port: Puerto externo a abrir.
+        protocol: "TCP", "UDP" o "TCP+UDP" (default).
+        internal_host: IP interna destino. Si None o "auto",
+            se detecta automaticamente la IP local del host en la subred
+            del router (llamando al helper equivalente a zte_get_local_ip).
+        internal_port: Puerto interno. Si None, se usa el mismo que `port`.
+        name: Nombre descriptivo. Si None, se genera como "port_<port>".
+
+    Para rangos de puertos o control total, usa `zte_add_port_forward`.
+
+    Flujo recomendado:
+        1. Pide al usuario el puerto a abrir.
+        2. Llama a zte_get_local_ip y propon la IP detectada.
+        3. Confirma con el usuario antes de abrir (destino IP y puerto interno).
+        4. Llama a zte_open_port con los valores acordados.
+    """
+    try:
+        if internal_host is None or internal_host.lower() == "auto":
+            detected = _get_local_ip_for(ZTE_HOST)
+            if detected is None:
+                return (
+                    f"Error: no se pudo detectar la IP local hacia {ZTE_HOST}. "
+                    "Pasa internal_host explicitamente."
+                )
+            internal_host = detected
+
+        if internal_port is None:
+            internal_port = port
+
+        if name is None:
+            name = f"port_{port}"
+
+        return await _create_port_forward(
+            name=name,
+            protocol=protocol,
+            ext_start=port,
+            ext_end=port,
+            internal_host=internal_host,
+            int_start=internal_port,
+            int_end=internal_port,
+        )
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    annotations={
         "title": "Anadir regla de port forwarding",
         "readOnlyHint": False,
         "destructiveHint": False,
@@ -294,7 +489,10 @@ async def zte_add_port_forward(
     internal_port_start: int,
     internal_port_end: int,
 ) -> str:
-    """Anade una nueva regla de redireccion de puertos (NAT).
+    """Anade una regla de port forwarding con control total.
+
+    Para el caso comun (un solo puerto -> IP local en el mismo puerto),
+    considera usar `zte_open_port`, que tiene defaults inteligentes.
 
     Args:
         name: Nombre descriptivo de la regla (max 32 chars).
@@ -306,49 +504,15 @@ async def zte_add_port_forward(
         internal_port_end: Puerto interno final.
     """
     try:
-        html, token = await _fetch_port_fwd_page()
-        if not token:
-            return "Error: no se pudo obtener el token de sesion."
-
-        proto_map = {"TCP+UDP": "0", "UDP": "1", "TCP": "2"}
-        proto_code = proto_map.get(protocol.upper(), "0")
-
-        form_data = {
-            "_SESSION_TOKEN": token,
-            "IF_ACTION": "new",
-            "IF_INDEX": "-1",
-            "Enable": "1",
-            "Name": name,
-            "Protocol": proto_code,
-            "WANCViewName": "IGD.WD1.WCD1.WCIP1",
-            "MinExtPort": str(external_port_start),
-            "MaxExtPort": str(external_port_end),
-            "InternalHost": internal_host,
-            "MinIntPort": str(internal_port_start),
-            "MaxIntPort": str(internal_port_end),
-            "MinRemoteHost": "0.0.0.0",
-            "MaxRemoteHost": "0.0.0.0",
-            "MacEnable": "0",
-            "InternalMacHost": "NULL",
-            "Description": "",
-            "LeaseDuration": "NULL",
-            "PortMappCreator": "NULL",
-            "ViewName": "NULL",
-            "WANCName": "NULL",
-        }
-
-        resp_html = await _post_form(form_data)
-        err = _check_response_error(resp_html)
-        if err:
-            return f"Error del router: {err}"
-
-        html2, _ = await _fetch_port_fwd_page()
-        rules = _parse_rules(html2)
-        added = any(r.get("Name") == name for r in rules)
-
-        lines = [f"{'Regla anadida.' if added else 'No se pudo verificar.'}\n"]
-        lines.extend(_format_rule(i, r) for i, r in enumerate(rules))
-        return "\n".join(lines)
+        return await _create_port_forward(
+            name=name,
+            protocol=protocol,
+            ext_start=external_port_start,
+            ext_end=external_port_end,
+            internal_host=internal_host,
+            int_start=internal_port_start,
+            int_end=internal_port_end,
+        )
     except Exception as exc:
         return f"Error: {exc}"
 
