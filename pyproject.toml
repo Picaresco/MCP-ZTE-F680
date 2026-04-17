@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zte-f680-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "MCP server to manage NAT / port forwarding on ZTE ZXHN F680 routers"
 readme = "README.md"
 license = { text = "MIT" }
@@ -63,4 +63,16 @@ include = [
   "README.md",
   "LICENSE",
   "pyproject.toml",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.0.0",
+  "pytest-asyncio>=0.23.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "router: tests que requieren router ZTE real (desactivados por defecto)",
 ]
