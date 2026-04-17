@@ -3,74 +3,37 @@
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import os
-import random
-import re
 import socket
-import sys
-import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-import httpx
-from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-load_dotenv()
-
-# ---------------------------------------------------------------------------
-# Configuracion (desde .env o variables de entorno)
-# ---------------------------------------------------------------------------
-ZTE_HOST: str = os.getenv("ZTE_HOST", "192.168.1.1")
-ZTE_USER: str = os.getenv("ZTE_USER", "1234")
-ZTE_PASSWORD: str = os.getenv("ZTE_PASSWORD", "")
-
-FORM_URL = "getpage.gch?pid=1002&nextpage=app_virtual_conf_t.gch"
-SESSION_TIMEOUT: float = 45.0
-
-# Estado global
-_http_client: httpx.AsyncClient | None = None
-_session_valid: bool = False
-_last_request_time: float = 0.0
+from zte_f680_mcp import http_client
+from zte_f680_mcp.parsers import group_by_numeric_suffix, parse_transfer_meaning
 
 
 # ---------------------------------------------------------------------------
-# Utilidades de parseo
+# Helpers NAT (permanecen en server.py porque son logica de negocio)
 # ---------------------------------------------------------------------------
-def _decode_hex_escapes(s: str) -> str:
-    """Reemplaza \\x2e -> '.', \\x3a -> ':', etc."""
-    return re.sub(
-        r"\\x([0-9a-fA-F]{2})",
-        lambda m: chr(int(m.group(1), 16)),
-        s,
-    )
-
-
 def _parse_rules(html: str) -> list[dict[str, str]]:
-    """Extrae reglas de port forwarding del HTML de app_virtual_conf_t.gch."""
-    pat = re.compile(r"Transfer_meaning\('(\w+)'\s*,\s*'([^']*)'\)")
-    rows: dict[int, dict[str, str]] = {}
-    for m in pat.finditer(html):
-        full_name = m.group(1)
-        raw_value = m.group(2)
-        m2 = re.match(r"^(.*?)(\d+)$", full_name)
-        if not m2:
-            continue
-        field_name = m2.group(1)
-        row_index = int(m2.group(2))
-        value = _decode_hex_escapes(raw_value)
-        if row_index not in rows:
-            rows[row_index] = {}
-        rows[row_index][field_name] = value
-    return [rows[i] for i in sorted(rows.keys()) if "Name" in rows.get(i, {})]
+    """Extrae reglas de port forwarding (usa agrupacion por sufijo numerico)."""
+    data = parse_transfer_meaning(html)
+    fields = [
+        "Name", "Protocol", "Enable", "MinExtPort", "MaxExtPort",
+        "InternalHost", "MinIntPort", "MaxIntPort", "ViewName",
+    ]
+    rows = group_by_numeric_suffix(data, prefixes=fields)
+    return [r for r in rows if r.get("Name")]
 
 
-def _extract_session_token(html: str) -> str | None:
-    """Extrae el _SESSION_TOKEN anti-CSRF de la pagina."""
-    m = re.search(r'session_token\s*=\s*"(\d+)"', html)
-    return m.group(1) if m else None
+def _check_response_error(html: str) -> str | None:
+    """Busca errores en la respuesta del router. Retorna msg o None."""
+    data = parse_transfer_meaning(html)
+    val = data.get("IF_ERRORSTR")
+    if val and val != "SUCC":
+        return val
+    return None
 
 
 def _format_rule(i: int, rule: dict[str, str]) -> str:
@@ -85,18 +48,6 @@ def _format_rule(i: int, rule: dict[str, str]) -> str:
         f"{rule.get('MinIntPort', '?')}-{rule.get('MaxIntPort', '?')} | "
         f"{enabled}"
     )
-
-
-def _check_response_error(html: str) -> str | None:
-    """Busca errores en la respuesta del router. Retorna msg o None."""
-    errors = re.findall(
-        r"Transfer_meaning\('IF_ERRORSTR'\s*,\s*'([^']*)'\)", html
-    )
-    for err in errors:
-        val = _decode_hex_escapes(err)
-        if val and val != "SUCC":
-            return val
-    return None
 
 
 def _get_local_ip_for(target_host: str) -> str | None:
@@ -123,112 +74,6 @@ def _get_local_ip_for(target_host: str) -> str | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Autenticacion y sesion
-# ---------------------------------------------------------------------------
-async def _login(client: httpx.AsyncClient) -> bool:
-    """Autentica contra el ZTE F680. Retorna True si exito."""
-    try:
-        resp = await client.get(f"http://{ZTE_HOST}/")
-    except (httpx.ConnectError, httpx.TimeoutException) as exc:
-        print(f"ZTE: error conectando a {ZTE_HOST} ({exc})", file=sys.stderr)
-        return False
-
-    html = resp.text
-    mt = re.search(r'Frm_Logintoken",\s*"(\d+)"', html)
-    mc = re.search(r'Frm_Loginchecktoken",\s*"(\d+)"', html)
-    if not mt or not mc:
-        print("ZTE: no se encontraron tokens de login", file=sys.stderr)
-        return False
-
-    lock_match = re.search(
-        r"Math\.min\(60,\s*(\d+)\s*\+\s*60\s*-\s*(\d+)\)", html
-    )
-    if lock_match:
-        val1, val2 = int(lock_match.group(1)), int(lock_match.group(2))
-        lock_time = min(60, val1 + 60 - val2)
-        if lock_time > 0:
-            print(
-                f"ZTE: bloqueado por intentos fallidos, esperando {lock_time + 2}s...",
-                file=sys.stderr,
-            )
-            await asyncio.sleep(lock_time + 2)
-            resp = await client.get(f"http://{ZTE_HOST}/")
-            html = resp.text
-            mt = re.search(r'Frm_Logintoken",\s*"(\d+)"', html)
-            mc = re.search(r'Frm_Loginchecktoken",\s*"(\d+)"', html)
-            if not mt or not mc:
-                return False
-
-    rnd = random.randint(10000000, 99999999)
-    pw_hash = hashlib.sha256(
-        (ZTE_PASSWORD + str(rnd)).encode("utf-8")
-    ).hexdigest()
-
-    form_data = {
-        "action": "login",
-        "Username": ZTE_USER,
-        "Password": pw_hash,
-        "Frm_Logintoken": mt.group(1),
-        "UserRandomNum": str(rnd),
-        "port": "",
-        "Frm_Loginchecktoken": mc.group(1),
-    }
-    await client.post(f"http://{ZTE_HOST}/", data=form_data)
-    return "SID" in dict(client.cookies)
-
-
-async def _ensure_session() -> httpx.AsyncClient:
-    """Retorna un cliente HTTP autenticado, re-logueando si es necesario."""
-    global _http_client, _session_valid, _last_request_time
-
-    now = time.monotonic()
-
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0),
-            follow_redirects=False,
-        )
-        _session_valid = False
-
-    if not _session_valid or (now - _last_request_time) > SESSION_TIMEOUT:
-        ok = await _login(_http_client)
-        if not ok:
-            raise RuntimeError(
-                f"Login fallido en {ZTE_HOST}. "
-                "Verifica ZTE_USER/ZTE_PASSWORD en .env"
-            )
-        _session_valid = True
-        print(f"ZTE: sesion iniciada en {ZTE_HOST}", file=sys.stderr)
-
-    _last_request_time = now
-    return _http_client
-
-
-async def _fetch_port_fwd_page() -> tuple[str, str | None]:
-    """Carga la pagina de port forwarding. Retorna (html, session_token)."""
-    client = await _ensure_session()
-    resp = await client.get(f"http://{ZTE_HOST}/{FORM_URL}")
-
-    if len(resp.text) < 1000:
-        global _session_valid
-        _session_valid = False
-        client = await _ensure_session()
-        resp = await client.get(f"http://{ZTE_HOST}/{FORM_URL}")
-
-    token = _extract_session_token(resp.text)
-    return resp.text, token
-
-
-async def _post_form(form_data: dict[str, str]) -> str:
-    """Envia POST al formulario de port forwarding. Retorna HTML respuesta."""
-    client = await _ensure_session()
-    resp = await client.post(
-        f"http://{ZTE_HOST}/{FORM_URL}", data=form_data
-    )
-    return resp.text
-
-
 async def _create_port_forward(
     name: str,
     protocol: str,
@@ -244,7 +89,7 @@ async def _create_port_forward(
     Retorna un string con el resultado y la lista actualizada de reglas,
     o un mensaje de error.
     """
-    html, token = await _fetch_port_fwd_page()
+    html, token = await http_client.fetch_port_fwd_page()
     if not token:
         return "Error: no se pudo obtener el token de sesion."
 
@@ -275,12 +120,12 @@ async def _create_port_forward(
         "WANCName": "NULL",
     }
 
-    resp_html = await _post_form(form_data)
+    resp_html = await http_client.post_port_fwd_form(form_data)
     err = _check_response_error(resp_html)
     if err:
         return f"Error del router: {err}"
 
-    html2, _ = await _fetch_port_fwd_page()
+    html2, _ = await http_client.fetch_port_fwd_page()
     rules = _parse_rules(html2)
     added = any(r.get("Name") == name for r in rules)
 
@@ -294,33 +139,9 @@ async def _create_port_forward(
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(server: FastMCP) -> AsyncIterator[None]:
-    """Gestiona el ciclo de vida de la conexion HTTP al ZTE."""
-    global _http_client, _session_valid
-    try:
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0),
-            follow_redirects=False,
-        )
-        ok = await _login(_http_client)
-        if ok:
-            _session_valid = True
-            print(f"ZTE F680: sesion iniciada en {ZTE_HOST}", file=sys.stderr)
-        else:
-            print(
-                f"Aviso: no se pudo iniciar sesion en {ZTE_HOST}. "
-                "Se reintentara al ejecutar herramientas.",
-                file=sys.stderr,
-            )
-    except Exception as exc:
-        print(f"Aviso: error conectando a {ZTE_HOST} ({exc})", file=sys.stderr)
-
+    await http_client.startup()
     yield
-
-    if _http_client is not None:
-        await _http_client.aclose()
-        _http_client = None
-        _session_valid = False
-        print("ZTE F680: sesion cerrada.", file=sys.stderr)
+    await http_client.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +189,7 @@ mcp = FastMCP(
 async def zte_get_port_forwards() -> str:
     """Lista todas las reglas NAT/port forwarding configuradas."""
     try:
-        html, _ = await _fetch_port_fwd_page()
+        html, _ = await http_client.fetch_port_fwd_page()
         rules = _parse_rules(html)
         if not rules:
             return "No hay reglas de port forwarding configuradas."
@@ -400,10 +221,10 @@ async def zte_get_local_ip() -> str:
       3. Preguntar: "Redirijo 8080 -> 192.168.1.133:8080?"
       4. Si confirma: zte_open_port(port=8080)
     """
-    ip = _get_local_ip_for(ZTE_HOST)
+    ip = _get_local_ip_for(http_client.ZTE_HOST)
     if ip is None:
         return (
-            f"No se pudo detectar la IP local hacia {ZTE_HOST}. "
+            f"No se pudo detectar la IP local hacia {http_client.ZTE_HOST}. "
             "Verifica conectividad con el router."
         )
     return ip
@@ -445,10 +266,11 @@ async def zte_open_port(
     """
     try:
         if internal_host is None or internal_host.lower() == "auto":
-            detected = _get_local_ip_for(ZTE_HOST)
+            detected = _get_local_ip_for(http_client.ZTE_HOST)
             if detected is None:
                 return (
-                    f"Error: no se pudo detectar la IP local hacia {ZTE_HOST}. "
+                    f"Error: no se pudo detectar la IP local hacia "
+                    f"{http_client.ZTE_HOST}. "
                     "Pasa internal_host explicitamente."
                 )
             internal_host = detected
@@ -548,7 +370,7 @@ async def zte_modify_port_forward(
         internal_port_end: Puerto interno final.
     """
     try:
-        html, token = await _fetch_port_fwd_page()
+        html, token = await http_client.fetch_port_fwd_page()
         if not token:
             return "Error: no se pudo obtener el token de sesion."
 
@@ -560,7 +382,7 @@ async def zte_modify_port_forward(
         proto_map = {"TCP+UDP": "0", "UDP": "1", "TCP": "2"}
         proto_code = proto_map.get(protocol.upper(), "0")
 
-        html, token = await _fetch_port_fwd_page()
+        html, token = await http_client.fetch_port_fwd_page()
         if not token:
             return "Error: no se pudo obtener el token de sesion."
 
@@ -588,12 +410,12 @@ async def zte_modify_port_forward(
             "WANCName": "NULL",
         }
 
-        resp_html = await _post_form(form_data)
+        resp_html = await http_client.post_port_fwd_form(form_data)
         err = _check_response_error(resp_html)
         if err:
             return f"Error del router: {err}"
 
-        html2, _ = await _fetch_port_fwd_page()
+        html2, _ = await http_client.fetch_port_fwd_page()
         rules = _parse_rules(html2)
         lines = ["Regla modificada.\n"]
         lines.extend(_format_rule(i, r) for i, r in enumerate(rules))
@@ -616,7 +438,7 @@ async def zte_delete_port_forward(index: int) -> str:
         index: Indice de la regla (obtenido con zte_get_port_forwards).
     """
     try:
-        html, token = await _fetch_port_fwd_page()
+        html, token = await http_client.fetch_port_fwd_page()
         if not token:
             return "Error: no se pudo obtener el token de sesion."
 
@@ -632,12 +454,12 @@ async def zte_delete_port_forward(index: int) -> str:
             "IF_INDEX": str(index),
         }
 
-        resp_html = await _post_form(form_data)
+        resp_html = await http_client.post_port_fwd_form(form_data)
         err = _check_response_error(resp_html)
         if err:
             return f"Error del router: {err}"
 
-        html2, _ = await _fetch_port_fwd_page()
+        html2, _ = await http_client.fetch_port_fwd_page()
         rules_after = _parse_rules(html2)
 
         lines = [f"Regla '{deleted_name}' borrada.\n"]
@@ -677,30 +499,134 @@ async def zte_run_page(page_name: str, raw: bool = False) -> str:
         - sec_firewall_conf_t.gch (firewall)
     """
     try:
-        client = await _ensure_session()
-        url = f"http://{ZTE_HOST}/getpage.gch?pid=1002&nextpage={page_name}"
-        resp = await client.get(url)
-
-        if len(resp.text) < 1000:
-            global _session_valid
-            _session_valid = False
-            client = await _ensure_session()
-            resp = await client.get(url)
+        html = await http_client.fetch_html(page_name)
 
         if raw:
-            return resp.text
+            return html
 
-        pat = re.compile(r"Transfer_meaning\('(\w+)'\s*,\s*'([^']*)'\)")
-        items: list[str] = []
-        for m in pat.finditer(resp.text):
-            name = m.group(1)
-            val = _decode_hex_escapes(m.group(2))
-            items.append(f"  {name}: {val}")
-
-        if not items:
+        data = parse_transfer_meaning(html)
+        if not data:
             return f"No se encontraron datos Transfer_meaning en {page_name}"
 
+        items = [f"  {k}: {v}" for k, v in data.items()]
         return f"Pagina: {page_name}\n" + "\n".join(items)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Info del dispositivo ZTE (modelo, firmware, serie)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+)
+async def zte_get_device_info() -> str:
+    """Devuelve modelo, serie, firmware, hardware, bootloader y chipsets WiFi.
+
+    Lee status_dev_info_t.gch. Esta pagina no incluye uptime, CPU ni RAM
+    en el firmware Jazztel; esos datos viven en otras paginas.
+    """
+    try:
+        from zte_f680_mcp import pages
+        from zte_f680_mcp.formatters import format_device_info
+        data = await pages.fetch_device_info()
+        return format_device_info(data)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Info WiFi (2.4 + 5 GHz)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+)
+async def zte_get_wifi_info() -> str:
+    """Devuelve SSIDs, canal, estandar, seguridad, clave PSK, BSSID y
+    estadisticas de ambas bandas WiFi (2.4 y 5 GHz)."""
+    try:
+        from zte_f680_mcp import pages
+        from zte_f680_mcp.formatters import format_wifi_info
+        data = await pages.fetch_wifi_info()
+        return format_wifi_info(data)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Dispositivos conectados al router (DHCP leases)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+)
+async def zte_get_dhcp_leases() -> str:
+    """Lista los dispositivos conectados al router: IP, MAC, hostname,
+    tipo de conexion (LAN/WiFi) y tiempo de expiracion del lease DHCP."""
+    try:
+        from zte_f680_mcp import pages
+        from zte_f680_mcp.formatters import format_dhcp_leases
+        data = await pages.fetch_dhcp_leases()
+        return format_dhcp_leases(data)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Clientes WiFi asociados (con senal RSSI)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+)
+async def zte_get_wifi_clients() -> str:
+    """Lista los dispositivos conectados por WiFi con su RSSI (senal),
+    banda, modo (11ac/11n) y tasa TX/RX."""
+    try:
+        from zte_f680_mcp import pages
+        from zte_f680_mcp.formatters import format_wifi_clients
+        data = await pages.fetch_wifi_clients()
+        return format_wifi_clients(data)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Estado DMZ",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+)
+async def zte_get_dmz() -> str:
+    """Devuelve el estado de la zona desmilitarizada (DMZ) y el host interno
+    configurado como destino."""
+    try:
+        from zte_f680_mcp import pages
+        from zte_f680_mcp.formatters import format_dmz
+        data = await pages.fetch_dmz()
+        return format_dmz(data)
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@mcp.tool(
+    annotations={
+        "title": "Estado conexion WAN (IP publica, DNS, uptime)",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+    }
+)
+async def zte_get_wan_status() -> str:
+    """Devuelve IP publica, gateway, DNS, MAC WAN, tipo de conexion y
+    uptime del enlace WAN del router."""
+    try:
+        from zte_f680_mcp import pages
+        from zte_f680_mcp.formatters import format_wan_status
+        data = await pages.fetch_wan_status()
+        return format_wan_status(data)
     except Exception as exc:
         return f"Error: {exc}"
 
