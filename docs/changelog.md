@@ -1,3 +1,21 @@
+## 2026-09-23 - v0.3.1 - fix: fijar mcp < 2
+
+mcp 2.0 (2026-07-28) elimino `mcp.server.fastmcp` (FastMCP -> MCPServer) y la
+dependencia `mcp[cli]>=1.0.0` sin tope hacia que `uvx zte-f680-mcp` resolviera
+mcp 2.x y el servidor muriera al importar (Claude Code: CONNECT_TIMEOUT /
+CONNECTION_CLOSED). Ahora `mcp[cli]>=1.0.0,<2`. Sin cambios de codigo.
+Workaround para 0.3.0: `uvx --with "mcp[cli]~=1.0" zte-f680-mcp`.
+
+## 2026-04-18 - v0.3.0 publicada en PyPI
+
+Pipeline de release ejecutado: TestPyPI (validado con venv limpio) -> PyPI
+real -> sync repo GitHub publico (commit `64a314d` en Picaresco/MCP-ZTE-F680)
+-> release v0.3.0 con notas completas. README publico actualizado con
+las nuevas tools preservando el banner.
+
+- PyPI: https://pypi.org/project/zte-f680-mcp/0.3.0/
+- GitHub release: https://github.com/Picaresco/MCP-ZTE-F680/releases/tag/v0.3.0
+
 ## 2026-04-17 - v0.3.0 — Fase 1: lectura formateada
 
 Anadidas 6 tools de solo lectura con salida en texto bonito:

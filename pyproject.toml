@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "zte-f680-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP server to manage NAT / port forwarding on ZTE ZXHN F680 routers"
 readme = "README.md"
 license = { text = "MIT" }
@@ -40,7 +40,7 @@ classifiers = [
   "Topic :: Internet",
 ]
 dependencies = [
-  "mcp[cli]>=1.0.0",
+  "mcp[cli]>=1.0.0,<2",  # mcp 2.0 elimino mcp.server.fastmcp
   "httpx>=0.27.0",
   "python-dotenv>=1.0.0",
   "pydantic>=2.0.0",

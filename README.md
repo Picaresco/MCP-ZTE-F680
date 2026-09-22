@@ -87,7 +87,7 @@ Edit `claude_desktop_config.json`:
   "mcpServers": {
     "zte": {
       "command": "uvx",
-      "args": ["zte-f680-mcp@latest"],
+      "args": ["zte-f680-mcp"],
       "env": {
         "ZTE_HOST": "192.168.1.1",
         "ZTE_USER": "1234",
@@ -98,7 +98,7 @@ Edit `claude_desktop_config.json`:
 }
 ```
 
-> **Tip**: `@latest` makes `uvx` check PyPI on every launch and use the newest version, so users get updates automatically. Remove `@latest` (just `"zte-f680-mcp"`) to pin to whatever was installed first.
+> **Tip**: avoid `zte-f680-mcp@latest`. It makes `uvx` re-resolve against PyPI on every launch, which can exceed the client's startup timeout (30 s in Claude Code) and creates a new cached environment each time. Use the plain package name and upgrade on demand (see *Upgrading existing installs*).
 
 ### Claude Code (CLI)
 
@@ -107,7 +107,7 @@ claude mcp add zte \
   --env ZTE_HOST=192.168.1.1 \
   --env ZTE_USER=1234 \
   --env ZTE_PASSWORD=your_password_here \
-  -- uvx zte-f680-mcp@latest
+  -- uvx zte-f680-mcp
 ```
 
 ### Cursor / Windsurf / Cline / Continue
@@ -122,7 +122,7 @@ from agents.mcp import MCPServerStdio
 zte = MCPServerStdio(
     params={
         "command": "uvx",
-        "args": ["zte-f680-mcp@latest"],
+        "args": ["zte-f680-mcp"],
         "env": {
             "ZTE_HOST": "192.168.1.1",
             "ZTE_USER": "1234",
@@ -145,6 +145,9 @@ uv cache clean zte-f680-mcp
 ```
 
 After this, the next time your MCP client launches the server, `uvx` will fetch the latest version.
+
+> **v0.3.0 users**: that release did not cap the `mcp` dependency, so a fresh install pulls `mcp` 2.x and the server
+> fails to start (`No module named 'mcp.server.fastmcp'`). Upgrade to 0.3.1+ with `uvx --refresh zte-f680-mcp`.
 
 ### Alternative: classic pip install
 
